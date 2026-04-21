@@ -1,17 +1,28 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { View, Text, TouchableOpacity, ActivityIndicator, ScrollView, Dimensions } from 'react-native';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { View, Text, TouchableOpacity, ActivityIndicator, ScrollView, Dimensions, Modal, TextInput, KeyboardAvoidingView, Platform, Keyboard } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
-import YoutubePlayer from "react-native-youtube-iframe"; // YOUTUBE MOTORU EKLENDİ
-import { getTrainingContent } from '../services/api';
+import { Ionicons, MaterialCommunityIcons, FontAwesome5 } from '@expo/vector-icons';
+import YoutubePlayer from "react-native-youtube-iframe";
+import { useAuthStore } from '../store/useAuthStore';
+import { getTrainingContent, getCourseAIResponse } from '../services/api';
 
 export default function VideoPlayerScreen({ route, navigation }) {
   const { training } = route.params; 
+  const user = useAuthStore((state) => state.user); 
   
   const [contentList, setContentList] = useState([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [loading, setLoading] = useState(true);
   const [playing, setPlaying] = useState(false);
+
+  // 🤖 YAPAY ZEKA ASİSTANI STATE'LERİ
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [inputText, setInputText] = useState('');
+  const [isAiTyping, setIsAiTyping] = useState(false);
+  const [chatMessages, setChatMessages] = useState([
+    { role: 'ai', text: `Merhaba ${user?.name?.split(' ')[0]}! Şu an "${training.title}" eğitimindesin. Bu konu hakkında aklına takılan bir şey olursa bana sorabilirsin. 💡` }
+  ]);
+  const scrollViewRef = useRef();
 
   useEffect(() => {
     const fetchContent = async () => {
@@ -30,9 +41,34 @@ export default function VideoPlayerScreen({ route, navigation }) {
   const onStateChange = useCallback((state) => {
     if (state === "ended") {
       setPlaying(false);
-      // İstersen video bitince otomatik sonraki adıma geçmesini de buraya yazabiliriz
     }
   }, []);
+
+  // 🚀 YAPAY ZEKA MESAJ GÖNDERME FONKSİYONU
+  const sendMessage = async () => {
+    if (!inputText.trim()) return;
+
+    const userMessage = inputText.trim();
+    setInputText('');
+    Keyboard.dismiss();
+
+    // 1. Kullanıcı mesajını ekrana bas
+    setChatMessages(prev => [...prev, { role: 'user', text: userMessage }]);
+    setIsAiTyping(true);
+
+    // 2. Backend'deki YZ'ye sor (Eğitim ID'si ile birlikte)
+    const aiReply = await getCourseAIResponse(userMessage, training.id, user.id);
+
+    // 3. YZ'nin cevabını ekrana bas
+    setIsAiTyping(false);
+    setChatMessages(prev => [...prev, { role: 'ai', text: aiReply }]);
+  };
+
+  // Sohbeti açarken videoyu otomatik durdurur
+  const toggleChat = () => {
+    if (!isChatOpen) setPlaying(false);
+    setIsChatOpen(!isChatOpen);
+  };
 
   if (loading) {
     return (
@@ -56,12 +92,11 @@ export default function VideoPlayerScreen({ route, navigation }) {
   }
 
   const currentItem = contentList[currentIndex];
-  // URL'den YouTube ID'sini çıkaran basit bir Regex fonksiyonu
   const getYoutubeId = (url) => {
     if (!url) return null;
     const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
     const match = url.match(regExp);
-    return (match && match[2].length === 11) ? match[2] : url; // Eğer zaten ID olarak (MF0aDsdpnhA) girilmişse direkt onu döndürür
+    return (match && match[2].length === 11) ? match[2] : url; 
   };
 
   const videoId = currentItem?.tip === 'video' ? getYoutubeId(currentItem.video_url) : null;
@@ -69,7 +104,7 @@ export default function VideoPlayerScreen({ route, navigation }) {
   const progressPercent = ((currentIndex + 1) / contentList.length) * 100;
 
   const handleNext = () => {
-    setPlaying(false); // Adım geçerken videoyu durdur
+    setPlaying(false); 
     if (isLastStep) {
       navigation.replace('Quiz', { egitim: training });
     } else {
@@ -131,18 +166,28 @@ export default function VideoPlayerScreen({ route, navigation }) {
           </View>
         )}
 
-        {/* Bilgilendirme Bannerı */}
         <View className="p-6">
           <View className="bg-sky-50 p-4 rounded-2xl flex-row items-center border border-sky-100">
             <Ionicons name="information-circle" size={24} color="#0284c7" />
             <Text className="ml-3 text-sky-800 text-xs font-bold flex-1 leading-5">
               {currentItem.tip === 'video' 
-                ? "Videoyu izlerken önemli noktaları not almayı unutma. 'Sıradaki Adım' butonu ile ilerleyebilirsin." 
+                ? "Videoyu izlerken kafana takılanları sağ alttaki yapay zeka asistanına sorabilirsin." 
                 : "Slaytı dikkatle okuyun. Bilgi testinde bu içeriklerden sorumlusunuz."}
             </Text>
           </View>
         </View>
       </ScrollView>
+
+      {/* YÜZEN (FLOATING) YZ ASİSTAN BUTONU */}
+      <TouchableOpacity 
+        onPress={toggleChat}
+        activeOpacity={0.8}
+        className="absolute bottom-28 right-5 bg-indigo-600 w-16 h-16 rounded-full items-center justify-center shadow-lg border-4 border-indigo-50"
+        style={{ elevation: 8 }}
+      >
+        <FontAwesome5 name="robot" size={24} color="white" />
+        <View className="absolute top-0 right-0 w-4 h-4 bg-red-500 rounded-full border-2 border-white" />
+      </TouchableOpacity>
 
       {/* Alt Kontrol Butonları */}
       <View className="p-6 bg-white border-t border-slate-100 flex-row justify-between shadow-lg">
@@ -164,6 +209,74 @@ export default function VideoPlayerScreen({ route, navigation }) {
           <Ionicons name={isLastStep ? "school" : "arrow-forward"} size={20} color="white" />
         </TouchableOpacity>
       </View>
+
+      {/* 🤖 AÇILIR YZ SOHBET PENCERESİ (MODAL) */}
+      <Modal visible={isChatOpen} animationType="slide" transparent={true} onRequestClose={toggleChat}>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} className="flex-1 justify-end bg-black/40">
+          <View className="bg-slate-50 h-[80%] rounded-t-3xl overflow-hidden shadow-2xl">
+            
+            {/* Chat Header */}
+            <View className="bg-indigo-600 px-5 py-4 flex-row items-center justify-between shadow-sm">
+              <View className="flex-row items-center">
+                <View className="bg-white/20 p-2 rounded-full mr-3">
+                  <FontAwesome5 name="robot" size={20} color="white" />
+                </View>
+                <View>
+                  <Text className="text-white font-black text-lg">Eğitim Asistanı</Text>
+                  <Text className="text-indigo-200 text-[10px] font-bold uppercase">AI Destekli Öğrenme</Text>
+                </View>
+              </View>
+              <TouchableOpacity onPress={toggleChat} className="bg-white/10 p-2 rounded-full">
+                <Ionicons name="close" size={24} color="white" />
+              </TouchableOpacity>
+            </View>
+
+            {/* Mesaj Alanı (HATANIN ÇÖZÜLDÜĞÜ YER: </View> YERİNE </ScrollView> GELDİ) */}
+            <ScrollView 
+              ref={scrollViewRef}
+              onContentSizeChange={() => scrollViewRef.current?.scrollToEnd({ animated: true })}
+              className="flex-1 p-5" 
+              showsVerticalScrollIndicator={false}
+            >
+              {chatMessages.map((msg, index) => (
+                <View key={index} className={`mb-4 max-w-[85%] ${msg.role === 'user' ? 'self-end' : 'self-start'}`}>
+                  <View className={`p-4 rounded-3xl ${msg.role === 'user' ? 'bg-indigo-600 rounded-tr-sm' : 'bg-white border border-slate-100 shadow-sm rounded-tl-sm'}`}>
+                    <Text className={`text-sm leading-6 ${msg.role === 'user' ? 'text-white' : 'text-slate-700 font-medium'}`}>
+                      {msg.text}
+                    </Text>
+                  </View>
+                </View>
+              ))}
+              {isAiTyping && (
+                <View className="self-start bg-white border border-slate-100 p-4 rounded-3xl rounded-tl-sm shadow-sm mb-4">
+                  <ActivityIndicator size="small" color="#4f46e5" />
+                </View>
+              )}
+            </ScrollView>
+
+            {/* Chat Input */}
+            <View className="bg-white px-5 py-4 border-t border-slate-100 flex-row items-center pb-8">
+              <TextInput
+                value={inputText}
+                onChangeText={setInputText}
+                placeholder="Konuyla ilgili bir soru sor..."
+                placeholderTextColor="#94a3b8"
+                className="flex-1 bg-slate-50 border border-slate-200 text-slate-800 px-5 py-3.5 rounded-full mr-3 text-sm font-medium"
+                onSubmitEditing={sendMessage}
+              />
+              <TouchableOpacity 
+                onPress={sendMessage}
+                disabled={!inputText.trim()}
+                className={`w-12 h-12 rounded-full items-center justify-center shadow-sm ${inputText.trim() ? 'bg-indigo-600' : 'bg-slate-200'}`}
+              >
+                <Ionicons name="send" size={18} color={inputText.trim() ? "white" : "#94a3b8"} style={{ marginLeft: 3 }} />
+              </TouchableOpacity>
+            </View>
+
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
     </SafeAreaView>
   );
 }

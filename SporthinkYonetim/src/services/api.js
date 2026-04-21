@@ -304,3 +304,19 @@ export const getDepartmentAnalytics = async (role, department) => {
     return [];
   }
 };
+
+// 23. Eğitime Özel AI Asistanı
+export const getCourseAIResponse = async (message, egitimId, userId) => {
+  try {
+    const response = await fetch(`${BASE_URL}/api/egitim-asistan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, egitimId, userId }),
+    });
+    const data = await response.json();
+    return data.reply;
+  } catch (error) {
+    console.error("Eğitim AI API Hatası:", error);
+    return "Bağlantı hatası oluştu. Lütfen tekrar dene.";
+  }
+};
