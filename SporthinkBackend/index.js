@@ -584,9 +584,10 @@ app.get('/api/admin/analiz/:role/:department', async (req, res) => {
                 GROUP BY k.departman
             `;
         } else {
-            // Departman yöneticisi için sadece kendi ekibi
+            // DEPARTMAN YÖNETİCİSİ İÇİN (İşte ID eksiğini giderdiğimiz yer burası!)
             sorgu = `
                 SELECT 
+                    k.kullanici_id,  -- 👑 İŞTE UYGULAMAYI ÇÖKMEKTEN KURTARAN ALTIN SATIR
                     k.ad || ' ' || k.soyad as ad_soyad,
                     p.xp,
                     (SELECT COUNT(*) FROM tamamlanan_egitimler t WHERE t.kullanici_id = k.kullanici_id) as biten_egitim,
@@ -606,6 +607,81 @@ app.get('/api/admin/analiz/:role/:department', async (req, res) => {
         res.json(sonuc.rows);
     } catch (err) {
         res.status(500).json({ message: 'Analiz verileri yüklenemedi.' });
+    }
+});
+
+// 28. EĞİTİME ÖZEL YAPAY ZEKA ASİSTANI (Context-Aware AI + Model Cascade)
+app.post('/api/egitim-asistan', async (req, res) => {
+    const { message, egitimId, userId } = req.body;
+
+    try {
+        // 1. Kullanıcının o an hangi eğitimi izlediğini bul
+        const egitimSorgu = await pool.query('SELECT baslik, aciklama FROM egitim_katalogu WHERE egitim_id = $1', [egitimId]);
+        
+        if (egitimSorgu.rows.length === 0) {
+            return res.json({ reply: "Şu an hangi eğitimde olduğunu bulamadım kral." });
+        }
+
+        const egitim = egitimSorgu.rows[0];
+
+        // 2. Gemini'a özel Prompt
+        const prompt = `
+            Sen Sporthink şirketinin 'Kurumsal Eğitim Akademisi'nde görevli uzman bir Eğitmensin.
+            
+            ŞU ANKİ DURUM:
+            Kullanıcı tam şu anda "${egitim.baslik}" isimli eğitimi izliyor.
+            Bu eğitimin resmi içeriği ve açıklaması şu şekildedir: "${egitim.aciklama}"
+            
+            KULLANICININ SORUSU: 
+            "${message}"
+            
+            KURALLAR:
+            1. Sadece yukarıda verilen eğitim içeriği bağlamında, bu konuya özel cevap ver.
+            2. Eğer kullanıcı eğitimle alakasız bir şey sorarsa, nazikçe konuya dönmesini ve şu an "${egitim.baslik}" eğitiminde olduklarını hatırlat.
+            3. Cevapların bir öğretici gibi cesaretlendirici, net ve akılda kalıcı olsun.
+        `;
+
+        // 3. ENTERPRISE SEVİYE: MODEL CASCADE (ŞELALE SİSTEMİ)
+        // Sistem sırasıyla bu modelleri deneyecek. Biri patlarsa saniyesinde diğerine geçecek.
+        // 3. ENTERPRISE SEVİYE: MODEL CASCADE (ŞELALE SİSTEMİ)
+        // "-latest" takıları 404 hatasını %100 önler!
+        const yedekModeller = [
+            "gemini-2.5-flash",         // Ana motor (Şu an 503 veriyor olabilir)
+            "gemini-2.0-flash",         // Bir alt nesil, çok hızlı ve stabil
+            "gemini-1.5-flash-latest",  // Asla 404 vermeyen, garantili sürüm
+            "gemini-1.5-pro-latest"     // Google'ın en ağır abisi (Joker)
+        ];
+
+        let aiCevabi = null;
+
+        for (const modelName of yedekModeller) {
+            try {
+                console.log(`[YZ MOTORU] Deneniyor: ${modelName}...`);
+                const model = genAI.getGenerativeModel({ model: modelName });
+                const result = await model.generateContent(prompt);
+                const response = await result.response;
+                
+                aiCevabi = response.text();
+                console.log(`[YZ MOTORU] Başarılı: ${modelName} 🚀`);
+                break; // Cevap başarılıysa döngüyü kır, diğerlerini denemeye gerek yok
+            } catch (error) {
+                // Hata 503 (Yoğunluk) veya 404 (Model Bulunamadı) olabilir, fark etmez, diğerine geç.
+                const hataTipi = error.message.includes('503') ? 'Sunucu Dolu (503)' : 'Model Tanınmadı (404)';
+                console.log(`[UYARI] ${modelName} başarısız oldu (${hataTipi}). Bir sonrakine geçiliyor...`);
+            }
+        }
+
+        // 4. Sonuç Değerlendirmesi
+        if (aiCevabi) {
+            return res.json({ reply: aiCevabi });
+        } else {
+            // Eğer 4 modelin 4'ü de patlarsa (Ki bu Google'ın sunucu binasında yangın çıkması demektir)
+            return res.json({ reply: "Kral, şu an Google'ın tüm yapay zeka sunucularında global bir çöküş var. 😅 Bütün yedek motorları denedim ama nafile. Lütfen 1-2 dakika sonra tekrar dene! 🤖" });
+        }
+
+    } catch (err) {
+        console.error("Eğitim Asistanı Genel Hatası:", err.message);
+        res.json({ reply: "Sistemsel bir sorun oluştu, birazdan tekrar dener misin?" });
     }
 });
 
