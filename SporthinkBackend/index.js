@@ -85,7 +85,7 @@ app.get('/api/liderlik', async (req, res) => {
     }
 });
 
-// 4. KULLANICI LİSTESİ UCU - TUTARLI HESAPLAMA
+// 4. KULLANICI LİSTESİ UCU - XP EKLENDİ
 app.get('/api/kullanicilar', async (req, res) => {
     try {
         const sorgu = `
@@ -95,6 +95,7 @@ app.get('/api/kullanicilar', async (req, res) => {
                 k.soyad, 
                 k.departman, 
                 k.rol,
+                COALESCE(p.xp, 0) as xp, -- İŞTE SORUNU ÇÖZEN SATIR (XP EKLENDİ)
                 COALESCE(
                     ROUND(
                         (COUNT(DISTINCT t.egitim_id)::numeric / 
@@ -102,9 +103,10 @@ app.get('/api/kullanicilar', async (req, res) => {
                     ), 0
                 ) as tamamlanma_orani
             FROM kullanicilar k
+            LEFT JOIN kullanici_puanlari p ON k.kullanici_id = p.kullanici_id
             LEFT JOIN atanan_egitimler a ON k.kullanici_id = a.kullanici_id
             LEFT JOIN tamamlanan_egitimler t ON k.kullanici_id = t.kullanici_id
-            GROUP BY k.kullanici_id, k.ad, k.soyad, k.departman, k.rol
+            GROUP BY k.kullanici_id, k.ad, k.soyad, k.departman, k.rol, p.xp
             ORDER BY tamamlanma_orani DESC, k.ad ASC
         `;
         const sonuc = await pool.query(sorgu);
@@ -685,6 +687,54 @@ app.post('/api/egitim-asistan', async (req, res) => {
     }
 });
 
+// 29. TÜM EĞİTİMLERİ GETİR (İnsan Kaynakları Katalog Görünümü İçin)
+app.get('/api/egitimler', async (req, res) => {
+    try {
+        // egitim_katalogu tablosundan aktif olanları en yenisi en üstte olacak şekilde çek
+        const query = 'SELECT * FROM egitim_katalogu WHERE aktif_mi = true ORDER BY egitim_id DESC';
+        const result = await pool.query(query);
+        res.json(result.rows);
+    } catch (err) {
+        console.error("Tüm Eğitimler Hatası:", err.message);
+        res.status(500).json({ message: "Eğitimler getirilemedi." });
+    }
+});
+
+// YENİ EKLENEN: EĞİTİM AÇIKLAMASINI GÜNCELLEME UCU (Bunu da eklemeliyiz ki kalem ikonuna basınca çalışsın)
+app.put('/api/admin/egitim-guncelle', async (req, res) => {
+    const { egitimId, aciklama } = req.body;
+    try {
+        await pool.query(
+            'UPDATE egitim_katalogu SET aciklama = $1 WHERE egitim_id = $2',
+            [aciklama, egitimId]
+        );
+        res.json({ message: 'Açıklama başarıyla güncellendi' });
+    } catch (err) {
+        console.error("Eğitim Güncelleme Hatası:", err.message);
+        res.status(500).json({ message: 'Açıklama güncellenemedi.' });
+    }
+});
+
+// EĞİTİM ANALİZİ (Atanan ve Tamamlayan Sayısı)
+app.get('/api/admin/egitim-analiz/:egitimId', async (req, res) => {
+    const { egitimId } = req.params;
+    try {
+        // Atananları bul (Hem atananlar tablosunda olanlar hem de bitirip tamamlananlara düşenler)
+        const atananSorgu = await pool.query('SELECT COUNT(DISTINCT kullanici_id) FROM atanan_egitimler WHERE egitim_id = $1', [egitimId]);
+        const bitenSorgu = await pool.query('SELECT COUNT(DISTINCT kullanici_id) FROM tamamlanan_egitimler WHERE egitim_id = $1', [egitimId]);
+
+        const atanan = parseInt(atananSorgu.rows[0].count) || 0;
+        const biten = parseInt(bitenSorgu.rows[0].count) || 0;
+        
+        // Gerçek Atanan Sayısı = Hala atananlarda bekleyenler + Bitirenler
+        const gercekAtanan = atanan + biten;
+        const basari_orani = gercekAtanan > 0 ? Math.round((biten / gercekAtanan) * 100) : 0;
+
+        res.json({ atanan_personel: gercekAtanan, basari_orani: basari_orani });
+    } catch (err) {
+        res.status(500).json({ message: 'Analiz çekilemedi.' });
+    }
+});
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Sunucu aktif: http://0.0.0.0:${PORT}`);
 });
