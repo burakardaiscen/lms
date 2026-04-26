@@ -85,7 +85,7 @@ app.get('/api/liderlik', async (req, res) => {
     }
 });
 
-// 4. KULLANICI LİSTESİ UCU - XP EKLENDİ
+// 4. KULLANICI LİSTESİ UCU - XP VE STREAK EKLENDİ
 app.get('/api/kullanicilar', async (req, res) => {
     try {
         const sorgu = `
@@ -95,7 +95,8 @@ app.get('/api/kullanicilar', async (req, res) => {
                 k.soyad, 
                 k.departman, 
                 k.rol,
-                COALESCE(p.xp, 0) as xp, -- İŞTE SORUNU ÇÖZEN SATIR (XP EKLENDİ)
+                COALESCE(p.xp, 0) as xp,
+                COALESCE(p.streak_count, 0) as streak, -- 🔥 İŞTE KODDAN UÇAN O KRİTİK STREAK SATIRI 🔥
                 COALESCE(
                     ROUND(
                         (COUNT(DISTINCT t.egitim_id)::numeric / 
@@ -106,7 +107,7 @@ app.get('/api/kullanicilar', async (req, res) => {
             LEFT JOIN kullanici_puanlari p ON k.kullanici_id = p.kullanici_id
             LEFT JOIN atanan_egitimler a ON k.kullanici_id = a.kullanici_id
             LEFT JOIN tamamlanan_egitimler t ON k.kullanici_id = t.kullanici_id
-            GROUP BY k.kullanici_id, k.ad, k.soyad, k.departman, k.rol, p.xp
+            GROUP BY k.kullanici_id, k.ad, k.soyad, k.departman, k.rol, p.xp, p.streak_count
             ORDER BY tamamlanma_orani DESC, k.ad ASC
         `;
         const sonuc = await pool.query(sorgu);
@@ -735,6 +736,246 @@ app.get('/api/admin/egitim-analiz/:egitimId', async (req, res) => {
         res.status(500).json({ message: 'Analiz çekilemedi.' });
     }
 });
+
+// 1. OTOMATİK ATAMA KURALLARINI GETİR
+app.get('/api/admin/atama-kurallari', async (req, res) => {
+    try {
+        const sorgu = `
+            SELECT k.*, e.baslik as egitim_adi 
+            FROM atama_kurallari k
+            JOIN egitim_katalogu e ON k.egitim_id = e.egitim_id
+            WHERE k.aktif_mi = true
+            ORDER BY k.kural_id DESC
+        `;
+        const sonuc = await pool.query(sorgu);
+        res.json(sonuc.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Kurallar getirilemedi." });
+    }
+});
+
+// 2. YENİ OTOMATİK ATAMA KURALI EKLE
+app.post('/api/admin/atama-kurali-ekle', async (req, res) => {
+    const { egitimId, tetikleyiciTur, tetikleyiciDeger } = req.body;
+    try {
+        await pool.query(
+            'INSERT INTO atama_kurallari (egitim_id, tetikleyici_tur, tetikleyici_deger) VALUES ($1, $2, $3)',
+            [egitimId, tetikleyiciTur, tetikleyiciDeger]
+        );
+        res.json({ message: "Otomasyon kuralı başarıyla eklendi! 🤖" });
+    } catch (err) {
+        res.status(500).json({ message: "Kural eklenirken hata oluştu." });
+    }
+});
+
+// 3. ÖĞRENME YOLLARINI (LEARNING PATHS) GETİR
+app.get('/api/admin/ogrenme-yollari', async (req, res) => {
+    try {
+        const sorgu = `
+            SELECT y.yol_id, y.yol_adi, 
+                   COUNT(a.asama_id) as egitim_sayisi
+            FROM ogrenme_yollari y
+            LEFT JOIN ogrenme_yolu_asamalari a ON y.yol_id = a.yol_id
+            WHERE y.aktif_mi = true
+            GROUP BY y.yol_id, y.yol_adi
+            ORDER BY y.yol_id DESC
+        `;
+        const sonuc = await pool.query(sorgu);
+        res.json(sonuc.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Öğrenme yolları getirilemedi." });
+    }
+});
+
+// 4. YENİ ÖĞRENME YOLU OLUŞTUR VE EĞİTİMLERİ DİZ
+app.post('/api/admin/ogrenme-yolu-ekle', async (req, res) => {
+    const { yolAdi, secilenEgitimler } = req.body; 
+    try {
+        const yolSonuc = await pool.query(
+            'INSERT INTO ogrenme_yollari (yol_adi) VALUES ($1) RETURNING yol_id',
+            [yolAdi]
+        );
+        const yeniYolId = yolSonuc.rows[0].yol_id;
+
+        for (let i = 0; i < secilenEgitimler.length; i++) {
+            await pool.query(
+                'INSERT INTO ogrenme_yolu_asamalari (yol_id, egitim_id, sira) VALUES ($1, $2, $3)',
+                [yeniYolId, secilenEgitimler[i], i + 1]
+            );
+        }
+        res.json({ message: "Öğrenme rotası başarıyla oluşturuldu! 🗺️" });
+    } catch (err) {
+        res.status(500).json({ message: "Rota oluşturulurken hata oluştu." });
+    }
+});
+
+// ==========================================
+// YENİ: DEPARTMANA TOPLU EĞİTİM ATAMA (BULK ASSIGN)
+// ==========================================
+app.post('/api/admin/toplu-ata', async (req, res) => {
+    const { departman, egitimId } = req.body;
+    try {
+        // 1. Önce o departmandaki tüm personelleri bul
+        const users = await pool.query('SELECT kullanici_id FROM kullanicilar WHERE departman = $1', [departman]);
+        
+        if (users.rows.length === 0) {
+            return res.status(404).json({ message: 'Bu departmanda hiç personel bulunamadı.' });
+        }
+
+        // 2. Her birine döngüyle eğitimi ata (Daha önce atanmışsa 'ON CONFLICT DO NOTHING' ile atla)
+        for (let user of users.rows) {
+            await pool.query(
+                'INSERT INTO atanan_egitimler (kullanici_id, egitim_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                [user.kullanici_id, egitimId]
+            );
+        }
+
+        res.json({ message: `${departman} ekibindeki ${users.rows.length} personele eğitim başarıyla atandı! 🚀` });
+    } catch (err) {
+        console.error("Toplu Atama Hatası:", err.message);
+        res.status(500).json({ message: 'Toplu atama sırasında hata oluştu.' });
+    }
+});
+
+// ==========================================
+// YENİ: SEÇİLİ BİRDEN FAZLA KİŞİYE EĞİTİM ATAMA (MULTI ASSIGN)
+// ==========================================
+app.post('/api/admin/coklu-ata', async (req, res) => {
+    const { userIds, egitimId } = req.body; // userIds bir dizi (array) olacak: [1, 2, 5]
+    
+    try {
+        if (!userIds || userIds.length === 0) {
+            return res.status(400).json({ message: 'Lütfen en az bir personel seçin.' });
+        }
+
+        // Seçilen her bir kullanıcı için döngüyle atama yapıyoruz
+        for (let id of userIds) {
+            await pool.query(
+                'INSERT INTO atanan_egitimler (kullanici_id, egitim_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                [id, egitimId]
+            );
+        }
+
+        res.json({ message: `Seçilen ${userIds.length} personele eğitim başarıyla atandı! 🎯` });
+    } catch (err) {
+        console.error("Çoklu Atama Hatası:", err.message);
+        res.status(500).json({ message: 'Atama sırasında hata oluştu.' });
+    }
+});
+
+// ==========================================
+// FAZ 2: 360 DERECE DEĞERLENDİRME & ANKET MERKEZİ
+// ==========================================
+
+// 1. TÜM ANKETLERİ GETİR
+app.get('/api/admin/anketler', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM anketler WHERE aktif_mi = true ORDER BY anket_id DESC');
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Anketler getirilemedi." });
+    }
+});
+
+// 2. YENİ ANKET VE SORULARINI OLUŞTUR
+app.post('/api/admin/anket-ekle', async (req, res) => {
+    const { baslik, sorular } = req.body; // sorular array olarak gelecek
+    try {
+        // Anketi oluştur
+        const anketSonuc = await pool.query(
+            'INSERT INTO anketler (baslik) VALUES ($1) RETURNING anket_id',
+            [baslik]
+        );
+        const yeniAnketId = anketSonuc.rows[0].anket_id;
+
+        // Soruları döngüyle ekle
+        for (let soru of sorular) {
+            if (soru && soru.trim() !== '') {
+                await pool.query(
+                    'INSERT INTO anket_sorulari (anket_id, soru_metni) VALUES ($1, $2)',
+                    [yeniAnketId, soru]
+                );
+            }
+        }
+        res.json({ message: "Anket başarıyla oluşturuldu! 📋" });
+    } catch (err) {
+        res.status(500).json({ message: "Anket oluşturulurken hata." });
+    }
+});
+
+// 3. 360 DERECE DEĞERLENDİRME ATAMASI YAP (KİM KİMİ DEĞERLENDİRECEK)
+app.post('/api/admin/anket-ata', async (req, res) => {
+    const { hedef_kullanici_id, degerlendiren_id, anket_id } = req.body;
+    try {
+        await pool.query(
+            'INSERT INTO uc_yuz_altmis_degerlendirme_atamalari (hedef_kullanici_id, degerlendiren_id, anket_id) VALUES ($1, $2, $3)',
+            [hedef_kullanici_id, degerlendiren_id, anket_id]
+        );
+        res.json({ message: "Değerlendirme başarıyla atandı! 🎯" });
+    } catch (err) {
+        res.status(500).json({ message: "Atama yapılamadı." });
+    }
+});
+
+// 4. YAPILAN ATAMALARI LİSTELE
+app.get('/api/admin/anket-atamalari', async (req, res) => {
+    try {
+        const sorgu = `
+            SELECT u.atama_id, u.durum,
+                   h.ad || ' ' || h.soyad as hedef_kullanici,
+                   d.ad || ' ' || d.soyad as degerlendiren,
+                   a.baslik as anket_adi
+            FROM uc_yuz_altmis_degerlendirme_atamalari u
+            JOIN kullanicilar h ON u.hedef_kullanici_id = h.kullanici_id
+            JOIN kullanicilar d ON u.degerlendiren_id = d.kullanici_id
+            JOIN anketler a ON u.anket_id = a.anket_id
+            ORDER BY u.atama_id DESC
+        `;
+        const sonuc = await pool.query(sorgu);
+        res.json(sonuc.rows);
+    } catch (err) {
+        res.status(500).json({ message: "Atamalar getirilemedi." });
+    }
+});
+
+// ==========================================
+// FAZ 3: YAPAY ZEKA DESTEKLİ YÖNETİCİ ASİSTANI
+// ==========================================
+app.post('/api/admin/ai-personel-analiz', async (req, res) => {
+    const { personelAd, departman, xp, tamamlanmaOrani, egitimKarnesi } = req.body;
+    
+    try {
+        // Önceden kurduğun Gemini bağlantısını kullanıyoruz
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        
+        // Yapay Zekaya vereceğimiz zeki prompt
+        const prompt = `
+            Sen Sporthink şirketinin kıdemli İK ve Yetenek Yönetimi yapay zekasısın.
+            Şu personelin performansını değerlendiren 3-4 cümlelik kısa, profesyonel ve vizyoner bir yönetici özeti yaz.
+            
+            PERSONEL BİLGİLERİ:
+            - Adı: ${personelAd}
+            - Departmanı: ${departman}
+            - Toplam Başarı Puanı (XP): ${xp}
+            - Genel Eğitim Tamamlanma Oranı: %${tamamlanmaOrani}
+            - Eğitim Geçmişi (Atanan ve Bitenler): ${JSON.stringify(egitimKarnesi)}
+            
+            KURALLAR:
+            1. Yazdığın metin bir şirketin yöneticisine (departman müdürüne) okunacak şekilde resmi ama cesaretlendirici olsun.
+            2. Personelin % oranına ve bitirdiği eğitimlere bakarak güçlü yönlerini vurgula.
+            3. Bekleyen (tamamlamadığı) eğitimleri varsa, onlara ağırlık vermesi gerektiği konusunda kısa bir aksiyon tavsiyesi ver.
+        `;
+
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        
+        res.json({ analiz: response.text() });
+    } catch (err) {
+        console.error("YZ Analiz Hatası:", err.message);
+        res.status(500).json({ analiz: "Yapay zeka şu an çok yoğun, lütfen 1-2 dakika sonra tekrar dene." });
+    }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Sunucu aktif: http://0.0.0.0:${PORT}`);
 });
